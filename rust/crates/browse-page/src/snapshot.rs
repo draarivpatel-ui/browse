@@ -577,7 +577,7 @@ async fn resolve_scope(page: &Arc<TabPage>, tab_state: &PageTab, options: &Optio
     }
     let parts = target::frame_parts(&within);
     if parts.len() > 1 {
-        let (frame, rest) = target::selector_frame(page, &within, Duration::from_millis(options.timeout_ms)).await?;
+        let (frame, rest) = target::selector_frame(page, tab_state, &within, Duration::from_millis(options.timeout_ms)).await?;
         let generation = page.frame(&frame).map(|f| f.generation).unwrap_or(0);
         let rest = rest.trim().to_string();
         let root = if rest.is_empty() || rest == "html" || rest == "body" { None } else { Some((target::normalize_selector(&rest), None, None)) };
@@ -940,7 +940,7 @@ async fn aria_snapshot(page: &Arc<TabPage>, tab_state: &PageTab, options: &Optio
             if target::is_compact_ref(within) {
                 bail!("within takes a selector in aria mode");
             }
-            let (frame, rest) = target::selector_frame(page, within, Duration::from_millis(options.timeout_ms)).await?;
+            let (frame, rest) = target::selector_frame(page, tab_state, within, Duration::from_millis(options.timeout_ms)).await?;
             let rest = target::normalize_selector(rest.trim());
             if rest.is_empty() {
                 (frame, None)

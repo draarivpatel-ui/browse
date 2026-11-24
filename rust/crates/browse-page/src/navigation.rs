@@ -352,7 +352,7 @@ async fn element_state(page: &Arc<TabPage>, tab_state: &PageTab, spec: &Spec, st
         Ok(resolved) => resolved,
         Err(error) => {
             let message = error.to_string();
-            if message.contains("matches") && message.contains("elements") || message.contains("Invalid selector") || message.contains("Unknown snapshot ref") || message.contains("belongs to tab") || message.contains("stale after a page change") {
+            if target::has_closest_hint(&error) || message.contains("Invalid selector") || message.contains("Unknown snapshot ref") || message.contains("belongs to tab") || message.contains("stale after a page change") {
                 return Err(error);
             }
             return Ok(matches!(state, "hidden" | "detached"));

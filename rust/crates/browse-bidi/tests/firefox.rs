@@ -665,6 +665,39 @@ async fn tools_work_with_a_real_profiles_prefs() {
     h.finish().await;
 }
 
+/// A selector that matches nothing names the closest elements that do exist, with their snapshot refs, so a caller
+/// can correct the selector without taking a separate snapshot (issue #390).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missing_selector_lists_the_closest_elements() {
+    let h = harness!();
+    let page = r#"<!doctype html><html><head><title>Messages</title></head><body>
+<main>
+<label>Mensaje <input id="message" aria-label="Mensaje"></label>
+<label>Asunto <input id="subject" aria-label="Asunto"></label>
+<button id="send">Enviar</button>
+</main>
+</body></html>"#;
+    h.server.page("/messages", page);
+    h.json("navigate", json!({ "url": h.server.url("/messages") })).await;
+    let snap = h.ok("snapshot", json!({})).await;
+    let message_ref = ref_of(&snap, "textbox \"Mensaje\"");
+
+    let err = h.err("fill", json!({ "fields": [ { "selector": "internal:role=textbox[name=/Mensajes/i]", "value": "hola" } ], "timeout": 200 })).await;
+    assert!(err.contains("No element matches selector"), "{err}");
+    assert!(err.contains("Closest elements"), "{err}");
+    assert!(err.contains(&format!("- textbox \"Mensaje\" [ref={message_ref}]")), "{err}");
+    assert!(!err.contains("- textbox \"Asunto\""), "{err}");
+
+    // A role nobody uses says so, rather than listing unrelated elements.
+    let no_role = h.err("fill", json!({ "fields": [ { "selector": "internal:role=combobox[name=/Mensaje/i]", "value": "hola" } ], "timeout": 200 })).await;
+    assert!(no_role.contains("The page has no combobox"), "{no_role}");
+
+    // A name nobody uses reports that nothing is close.
+    let no_name = h.err("fill", json!({ "fields": [ { "selector": "internal:role=textbox[name=/Inexistente/i]", "value": "hola" } ], "timeout": 200 })).await;
+    assert!(no_name.contains("No close elements"), "{no_name}");
+    h.finish().await;
+}
+
 /// `quit` closes the browser itself (`browser.close`), not just the session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quit_closes_firefox() {

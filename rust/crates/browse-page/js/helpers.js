@@ -77,6 +77,74 @@
     count(selector) {
       return this.queryAll(selector).length
     },
+    // Suggestions for a selector that matched nothing. `refs` is [id, role, name, selector] for the last snapshot;
+    // each item is [role, name, ref] where ref is the element's snapshot ref, if there is one. Returns
+    // { role, items } with up to 5 items, or { role, empty: true } when the page has no element of that role.
+    closest(selector, refs) {
+      const naming = createNaming()
+      const byRole = String(selector).match(/internal:role=([a-zA-Z-]+)/)
+      const role = byRole ? byRole[1] : null
+      const nameMatch = String(selector).match(/\[name=(\/.*\/[a-z]*|"[^"]*"|'[^']*'|[^\]]+)\]/)
+      let wanted = ""
+      let regex = null
+      if (nameMatch) {
+        const raw = nameMatch[1]
+        if (raw.startsWith("/")) {
+          const last = raw.lastIndexOf("/")
+          try { regex = new RegExp(raw.slice(1, last), raw.slice(last + 1)) } catch {}
+        } else {
+          wanted = raw.replace(/^["']|["']$/g, "").toLowerCase()
+        }
+      }
+      const named = (element, elementRole) => naming.identityNameFor(element, elementRole)
+      // How close a name is to the requested one: an exact or partial match first, then shared letters for a typo.
+      const similarity = (name) => {
+        if (!nameMatch) return 1
+        const lower = name.toLowerCase()
+        if (regex) {
+          regex.lastIndex = 0
+          if (regex.test(name)) return 3
+          // A one-letter typo in a short name: share most of the characters, ignoring order.
+          const wanted = regex.source.toLowerCase().replace(/[^a-z0-9 ]/g, "")
+          const pool = new Map()
+          for (const letter of lower) pool.set(letter, (pool.get(letter) ?? 0) + 1)
+          let shared = 0
+          for (const letter of wanted) {
+            const left = pool.get(letter) ?? 0
+            if (left > 0) { pool.set(letter, left - 1); shared++ }
+          }
+          const threshold = Math.max(1, wanted.length - 1)
+          return shared >= threshold ? 2 : 0
+        }
+        if (lower === wanted) return 3
+        if (lower.includes(wanted) || wanted.includes(lower)) return 2
+        return 0
+      }
+      const all = Array.from(document.querySelectorAll("*")).filter((element) => !hiddenFromAria(element))
+      const sameRole = role ? all.filter((element) => naming.roleFor(element) === role) : []
+      if (role && sameRole.length === 0) return { role, empty: true }
+      const candidates = (role ? sameRole : all).map((element) => {
+        const elementRole = naming.roleFor(element)
+        return { element, elementRole, name: named(element, elementRole) }
+      }).filter((candidate) => similarity(candidate.name) > 0)
+      const refByElement = new Map()
+      for (const [id, refRole, refName, refSelector] of refs) {
+        let found
+        try {
+          found = refSelector.includes(" >> ") ? this.queryAll(refSelector) : Array.from(document.querySelectorAll(refSelector))
+        } catch { continue }
+        for (const element of found) {
+          if (!refByElement.has(element) && (refRole == null || naming.roleFor(element) === refRole) && (refName == null || named(element, refRole) === refName)) {
+            refByElement.set(element, id)
+          }
+        }
+      }
+      // The closest name first, then document order; cap the list so the error stays readable.
+      const score = (candidate) => -similarity(candidate.name)
+      candidates.sort((a, b) => score(a) - score(b))
+      const items = candidates.slice(0, 5).map(({ element, elementRole, name }) => [elementRole, name, refByElement.get(element) ?? null])
+      return { role, items }
+    },
 
     // Snapshot refs: the elements matching the ref's selector that still have its role and exact name and are not
     // hidden from assistive technology.
