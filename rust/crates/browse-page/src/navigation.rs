@@ -352,7 +352,9 @@ async fn element_state(page: &Arc<TabPage>, tab_state: &PageTab, spec: &Spec, st
         Ok(resolved) => resolved,
         Err(error) => {
             let message = error.to_string();
-            if target::has_closest_hint(&error) || message.contains("Invalid selector") || message.contains("Unknown snapshot ref") || message.contains("belongs to tab") || message.contains("stale after a page change") {
+            // While waiting, a selector that is absent right now is a normal "not yet". Only hard errors (a bad
+            // selector, an ambiguous match, or a broken snapshot ref) should abort the wait.
+            if target::is_selector_failure(&error) || message.starts_with("Selector ") && message.contains(" matches ") || message.contains("Unknown snapshot ref") || message.contains("belongs to tab") || message.contains("stale after a page change") {
                 return Err(error);
             }
             return Ok(matches!(state, "hidden" | "detached"));

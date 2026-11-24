@@ -179,10 +179,12 @@ fn closest_hint(role: Option<&str>, items: &[ClosestItem], absent: bool) -> Stri
     format!("Closest elements on the page:\n{}", lines.collect::<Vec<_>>().join("\n"))
 }
 
-/// True when an error should keep its closest-element hint. Only selector no-match errors describe a bad selector;
-/// invalid selectors and stale refs have their own, more specific diagnostics.
-pub fn has_closest_hint(error: &anyhow::Error) -> bool {
-    error.to_string().starts_with("No element matches selector")
+/// True when an error describes a selector that cannot ever resolve: an ambiguous match or an invalid selector.
+/// Ref, navigation, and no-match errors have their own diagnostics; callers waiting for a selector to appear must
+/// treat those as a normal "not yet" instead.
+pub fn is_selector_failure(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.starts_with("Selector ") && message.contains(" it must match one.") || is_selector_error(&message)
 }
 
 /// The snapshot refs of one frame, as [id, role, name, selector] rows for the page-side `closest` helper.
@@ -448,7 +450,9 @@ mod tests {
         );
         assert_eq!(closest_hint(Some("combobox"), &[], true), "The page has no combobox");
         assert_eq!(closest_hint(None, &[], false), "No close elements on the page");
-        assert!(has_closest_hint(&anyhow::anyhow!("No element matches selector \"#missing\". Closest elements on the page:")));
-        assert!(!has_closest_hint(&anyhow::anyhow!("Timed out waiting for selector")));
+        assert!(!is_selector_failure(&anyhow::anyhow!("No element matches selector \"#missing\". Closest elements on the page:")));
+        assert!(is_selector_failure(&anyhow::anyhow!("Selector \"#x\" matches 2 elements; it must match one.")));
+        assert!(is_selector_failure(&anyhow::anyhow!("Invalid selector \"#[\": SyntaxError")));
+        assert!(!is_selector_failure(&anyhow::anyhow!("Timed out waiting for selector")));
     }
 }
