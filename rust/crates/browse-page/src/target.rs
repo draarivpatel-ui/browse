@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::state::RefTarget;
+
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 
@@ -150,11 +152,86 @@ fn selector_error(selector: &str, status: &str) -> Option<anyhow::Error> {
     ))
 }
 
+/// One `[role, name, ref]` suggestion from the page-side `closest` helper.
+type ClosestItem = (String, String, Option<String>);
+
+fn quoted(value: &str) -> String {
+    let short: String = value.chars().take(80).collect();
+    format!("{:?}", if value.chars().count() > 80 { format!("{short}...") } else { short })
+}
+
+/// Formats the "closest elements" part of a no-match error. `role` is the role from the selector, when it had one.
+/// `absent` means the page has no element of that role at all; otherwise an empty list means nothing was close.
+fn closest_hint(role: Option<&str>, items: &[ClosestItem], absent: bool) -> String {
+    if absent {
+        return match role {
+            Some(role) => format!("The page has no {role}"),
+            None => "No close elements on the page".to_string(),
+        };
+    }
+    if items.is_empty() {
+        return "No close elements on the page".to_string();
+    }
+    let lines = items.iter().map(|(role, name, reference)| match reference {
+        Some(id) => format!("  - {role} {} [ref={id}]", quoted(name)),
+        None => format!("  - {role} {}", quoted(name)),
+    });
+    format!("Closest elements on the page:\n{}", lines.collect::<Vec<_>>().join("\n"))
+}
+
+/// True when an error describes a selector that cannot ever resolve: an ambiguous match or an invalid selector.
+/// Ref, navigation, and no-match errors have their own diagnostics; callers waiting for a selector to appear must
+/// treat those as a normal "not yet" instead.
+pub fn is_selector_failure(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.starts_with("Selector ") && message.contains(" it must match one.") || is_selector_error(&message)
+}
+
+/// The snapshot refs of one frame, as [id, role, name, selector] rows for the page-side `closest` helper.
+pub fn frame_refs(tab_state: &PageTab, frame: &str) -> Vec<(String, String, Option<String>, String)> {
+    let registry = tab_state.refs.lock().unwrap();
+    registry
+        .selectors
+        .iter()
+        .filter(|entry: &(&String, &RefTarget)| entry.1.frame.as_ref().map(|(f, _)| f == frame).unwrap_or(true))
+        .map(|(id, target): (&String, &RefTarget)| (id.clone(), target.role.clone(), target.name.clone(), target.selector.clone()))
+        .collect()
+}
+
+async fn no_match_message(page: &Arc<TabPage>, frame: &str, full: &str, refs: &[(String, String, Option<String>, String)]) -> String {
+    let base = format!("No element matches selector {full:?}");
+    let Ok(value) = page.call_value(frame, "closest", vec![v(full), v(refs)], true).await else {
+        return base;
+    };
+    let Some(object) = value.as_object() else {
+        return base;
+    };
+    let role = object.get("role").and_then(Value::as_str);
+    let absent = object.get("empty") == Some(&Value::Bool(true));
+    if absent {
+        return format!("{base}. {}", closest_hint(role, &[], true));
+    }
+    let items: Vec<ClosestItem> = object
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|item| {
+                    let item = item.as_array()?;
+                    Some((item.first()?.as_str()?.to_string(), item.get(1)?.as_str()?.to_string(), item.get(2)?.as_str().map(str::to_string)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    format!("{base}. {}", closest_hint(role, &items, false))
+}
+
 /// Resolves a ref or selector, waiting for it to appear.
 pub async fn resolve(page: &Arc<TabPage>, tab_state: &PageTab, spec: &Spec, options: ResolveOptions) -> Result<Resolved> {
     let element = match spec {
         Spec::Ref(id) => resolve_ref(page, tab_state, id, options).await?,
-        Spec::Selector(selector) => resolve_selector(page, selector, options).await?,
+        Spec::Selector(selector) => resolve_selector(page, tab_state, selector, options).await?,
     };
     let label = page.call_element(&element, "describe", vec![], false).await.ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
     Ok(Resolved { element, label })
@@ -273,14 +350,15 @@ async fn resolve_aria_ref(page: &Arc<TabPage>, tab_state: &PageTab, id: &str, se
     }
 }
 
-async fn resolve_selector(page: &Arc<TabPage>, selector: &str, options: ResolveOptions) -> Result<Element> {
+async fn resolve_selector(page: &Arc<TabPage>, tab_state: &PageTab, selector: &str, options: ResolveOptions) -> Result<Element> {
     let parts = frame_parts(selector);
     let deadline = Instant::now() + options.timeout;
     let mut frame = page.main_frame();
     for (index, part) in parts.iter().enumerate() {
         let last = index == parts.len() - 1;
         let part = normalize_selector(if part.is_empty() { if last { "html" } else { "iframe" } } else { part });
-        let element = wait_query(page, &frame, &part, selector, deadline, options.timeout).await?;
+        let refs = frame_refs(tab_state, &frame);
+        let element = wait_query(page, &frame, &part, selector, &refs, deadline, options.timeout).await?;
         if last {
             return Ok(element);
         }
@@ -291,20 +369,21 @@ async fn resolve_selector(page: &Arc<TabPage>, selector: &str, options: ResolveO
 }
 
 /// The frame a selector's frame-entering parts lead to, and the selector left for that frame.
-pub async fn selector_frame(page: &Arc<TabPage>, selector: &str, timeout: Duration) -> Result<(String, String)> {
+pub async fn selector_frame(page: &Arc<TabPage>, tab_state: &PageTab, selector: &str, timeout: Duration) -> Result<(String, String)> {
     let parts = frame_parts(selector);
     let deadline = Instant::now() + timeout;
     let mut frame = page.main_frame();
     for part in &parts[..parts.len() - 1] {
         let part = normalize_selector(if part.is_empty() { "iframe" } else { part });
-        let element = wait_query(page, &frame, &part, selector, deadline, timeout).await?;
+        let refs = frame_refs(tab_state, &frame);
+        let element = wait_query(page, &frame, &part, selector, &refs, deadline, timeout).await?;
         let remaining = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(200));
         frame = page.content_frame(&element, remaining).await?;
     }
     Ok((frame, parts.last().cloned().unwrap_or_default()))
 }
 
-async fn wait_query(page: &Arc<TabPage>, frame: &str, part: &str, full: &str, deadline: Instant, timeout: Duration) -> Result<Element> {
+async fn wait_query(page: &Arc<TabPage>, frame: &str, part: &str, full: &str, refs: &[(String, String, Option<String>, String)], deadline: Instant, timeout: Duration) -> Result<Element> {
     loop {
         page.ensure_no_dialog()?;
         match page.call_element_result(frame, "query", vec![v(part), v(true)], true).await {
@@ -326,7 +405,7 @@ async fn wait_query(page: &Arc<TabPage>, frame: &str, part: &str, full: &str, de
             }
         }
         if Instant::now() >= deadline {
-            bail!("No element matches selector {full:?} (waited {} ms)", timeout.as_millis());
+            bail!("{} (waited {} ms)", no_match_message(page, frame, full, refs).await, timeout.as_millis());
         }
         tokio::time::sleep(POLL).await;
     }
@@ -360,5 +439,20 @@ mod tests {
         assert_eq!(frame_parts("button"), vec!["button"]);
         assert_eq!(frame_parts("iframe[title=Pay] >> internal:control=enter-frame >> role=button"), vec!["iframe[title=Pay]", "role=button"]);
         assert_eq!(frame_parts("#a >> frame >> #b >> frame >> text=Hi"), vec!["#a", "#b", "text=Hi"]);
+    }
+
+    #[test]
+    fn closest_hint_lists_elements_with_refs() {
+        let items = vec![("textbox".into(), "Mensaje".into(), Some("e3".into())), ("button".into(), "Enviar".into(), None)];
+        assert_eq!(
+            closest_hint(Some("textbox"), &items, false),
+            "Closest elements on the page:\n  - textbox \"Mensaje\" [ref=e3]\n  - button \"Enviar\""
+        );
+        assert_eq!(closest_hint(Some("combobox"), &[], true), "The page has no combobox");
+        assert_eq!(closest_hint(None, &[], false), "No close elements on the page");
+        assert!(!is_selector_failure(&anyhow::anyhow!("No element matches selector \"#missing\". Closest elements on the page:")));
+        assert!(is_selector_failure(&anyhow::anyhow!("Selector \"#x\" matches 2 elements; it must match one.")));
+        assert!(is_selector_failure(&anyhow::anyhow!("Invalid selector \"#[\": SyntaxError")));
+        assert!(!is_selector_failure(&anyhow::anyhow!("Timed out waiting for selector")));
     }
 }
